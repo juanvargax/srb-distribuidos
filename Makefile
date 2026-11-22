@@ -23,4 +23,9 @@ persistencia: persistencia.cpp common.hpp
 clean:
 	rm -f cliente gestor rmc cancelaciones persistencia
 
-.PHONY: all clean
+# Arma el .zip de la entrega con todo lo que esta en el repositorio (ultimo commit)
+zip:
+	git archive --format=zip --prefix=SRB_Entrega2/ -o SRB_Entrega2.zip HEAD
+	@echo "SRB_Entrega2.zip listo"
+
+.PHONY: all clean zip
