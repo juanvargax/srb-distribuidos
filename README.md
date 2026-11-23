@@ -115,9 +115,32 @@ sudo ./servicios/instalar.sh quitar   # volver a correr todo a mano
 
 Mientras los servicios estén activos no se corren los programas a mano en esa VM: chocarían por los puertos. Si se cambia `config.txt` o se recompila, `sudo systemctl restart 'srb-*'`.
 
-## 10. Qué muestra cada consola
+## 10. Pruebas (`pruebas/`)
+Todo se corre desde la carpeta del proyecto, con el sistema arriba.
+
+| Prueba | Dónde | Comando | Qué hace |
+|---|---|---|---|
+| Funcional | VM1 | `./pruebas/funcional.sh` | Manda las 14 solicitudes que cubren el enunciado (consulta, reserva, modificación, cancelación y sus rechazos), revisa cada respuesta y las 2 notificaciones, e imprime PASÓ/FALLÓ. Usa clientes con nombre nuevo y deja la BD como estaba, así que se puede repetir |
+| Caída de un proceso | VM2 o VM3 | `sudo ./pruebas/caida.sh srb-rmc@2` (`kill9` o `trabar` como segundo argumento) | Mata o congela el servicio y mide en cuántos segundos systemd lo tiene otra vez arriba con otro PID |
+| Experimento de la Tabla 1 | VM1 | `./pruebas/experimento.sh <A\|B\|C> <base\|escalable> [operaciones] [porMinuto]` | Lanza los 3, 5 u 8 clientes del escenario en modo carga y guarda sus CSV en `pruebas/resultados/<escenario>_<arquitectura>/` |
+| Análisis | VM1 | `python3 pruebas/analizar.py` | Con las 6 corridas, escribe `resumen.csv` y `resumen.md` (promedio y desviación de cada tipo, TPM) y las 4 gráficas del informe (necesita `sudo apt install python3-matplotlib`) |
+
+**Cómo correr los 6 experimentos**
+
+1. VM3: empezar con la BD limpia: `sudo systemctl stop srb-persistencia && rm -f reserva.db && sudo systemctl start srb-persistencia` (al no encontrar eventos carga `init_db.sql`).
+2. VM2, arquitectura base (1 gestor, 1 RMC): `sudo systemctl stop srb-gestor@2 srb-rmc@2 srb-rmc@3`.
+3. VM1: `./pruebas/experimento.sh A base`, luego `B base` y `C base`.
+4. VM2, arquitectura escalable (2 gestores, 3 RMC): `sudo systemctl start srb-gestor@2 srb-rmc@2 srb-rmc@3`.
+5. VM1: `./pruebas/experimento.sh A escalable`, `B escalable` y `C escalable`.
+6. VM1: `python3 pruebas/analizar.py`.
+
+Por defecto cada cliente manda 300 operaciones sin pausa (lo más rápido que responda el sistema), para medir capacidad. En la escalable los clientes se reparten entre los dos gestores (variable `SRB_GESTOR_INICIAL`); en la base todos van al gestor 1. El TPM se calcula con las respuestas exitosas de cada tipo dividido por la duración de la corrida.
+
+**Entrega:** `make zip` arma `SRB_Entrega2.zip` con todo lo que está en el repositorio.
+
+## 11. Qué muestra cada consola
 - **Persistencia:** cada orden que recibe, y la BD completa (tabla de eventos y tabla de reservas) al arrancar y después de cada reserva o cancelación (`Evento: E5 | Fecha: 2026-11-02 | Libres: 97 | Ocupados: 3` y `Reserva 1 | Evento: E5 | Fecha: 2026-11-02 | Cliente: juan | Asientos: 3`).
 - **RMC:** cada solicitud, lo que le pregunta a la persistencia y el resultado (ÉXITO o RECHAZO).
 - **Gestor:** cada solicitud y respuesta; cada minuto el TPM, que también se guarda en `tpm_gestor1.csv` (o `tpm_gestor2.csv`): `hora,consultas,reservas,modificaciones`.
 - **Cancelaciones:** cada cancelación, su resultado y la notificación publicada.
-- **Cliente:** el resultado y el tiempo de respuesta de cada solicitud (también en `metricas_<archivo o nombre>.csv`: `operacion,ms,resultado`) y las notificaciones como `[Notificacion] ...`.
+- **Cliente:** el resultado y el tiempo de respuesta de cada solicitud (también en `metricas_<archivo o nombre>.csv`: `operacion,inicio_ms,ms,resultado`) y las notificaciones como `[Notificacion] ...`.

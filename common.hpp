@@ -189,6 +189,13 @@ public:
 
     std::string donde() const { return direcciones_[actual_]; }
 
+    // empezar por otra direccion de la lista (0 = la primera). Se usa para repartir
+    // los clientes entre los dos gestores en los experimentos de la arquitectura escalable.
+    void empezarEn(size_t indice) {
+        actual_ = indice % direcciones_.size();
+        abrir();
+    }
+
 private:
     void abrir() {
         socket_ = zmq::socket_t(contexto_, zmq::socket_type::req);

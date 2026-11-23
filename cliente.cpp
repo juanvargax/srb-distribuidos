@@ -5,6 +5,10 @@
 // ./cliente carga C1 50 50 0 60 20
 //                                 -> genera 60 operaciones del cliente C1 al azar, con
 //                                    50 % consultas, 50 % reservas y 0 % modificaciones, 20 por minuto
+//                                    (porMinuto 0 = sin pausa, lo mas rapido que responda el sistema)
+//
+// Variable de entorno SRB_GESTOR_INICIAL=2: empieza por el gestor de respaldo en vez del principal
+// (los experimentos de la arquitectura escalable reparten asi los clientes entre los dos gestores).
 //
 // Formato de una solicitud (igual en la terminal y en el archivo):
 //   CONSULTA <AAAA-MM>
@@ -19,7 +23,8 @@
 // Las cancelaciones son asincronas: el gestor responde RECIBIDO de una vez y el resultado
 // llega despues como notificacion (SUB), que se imprime como [Notificacion] ...
 //
-// En los modos archivo y carga guarda el tiempo de cada solicitud en un CSV para las graficas.
+// En los modos archivo y carga guarda cada solicitud en un CSV para las graficas:
+//   operacion,inicio_ms,ms,resultado     (inicio_ms = hora en que salio, en ms desde 1970)
 
 #include "common.hpp"
 #include <atomic>
@@ -61,6 +66,17 @@ std::string enviarSolicitud(ReqConReintento& gestor, const std::string& linea, d
 
     if (!respuesta) return "SIN_RESPUESTA: ningun gestor respondio";
     return *respuesta;
+}
+
+// hora actual en milisegundos desde 1970 (para saber cuando salio cada solicitud y calcular el TPM)
+long long ahoraMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// pausa entre solicitudes para respetar 'porMinuto' (0 = sin pausa)
+void pausar(int porMinuto) {
+    if (porMinuto > 0) std::this_thread::sleep_for(std::chrono::milliseconds(60000 / porMinuto));
 }
 
 std::string resultadoDe(const std::string& respuesta) {   // para la columna del CSV
@@ -143,8 +159,7 @@ void modoArchivo(ReqConReintento& gestor, const std::string& ruta, int porMinuto
         return;
     }
     std::ofstream csv("metricas_" + ruta + ".csv");
-    csv << "operacion,ms,resultado" << std::endl;
-    int espera = 60000 / porMinuto;   // 20 por minuto = una cada 3000 ms
+    csv << "operacion,inicio_ms,ms,resultado" << std::endl;
 
     std::string linea;
     while (std::getline(archivo, linea)) {
@@ -152,12 +167,14 @@ void modoArchivo(ReqConReintento& gestor, const std::string& ruta, int porMinuto
         prepararNotificacion(linea);
 
         double ms;
+        long long inicio = ahoraMs();
         std::string respuesta = enviarSolicitud(gestor, linea, ms);
         std::cout << linea << "  =>  " << respuesta.substr(0, respuesta.find('\n'))
                   << "  (" << (int)ms << " ms)" << std::endl;
-        csv << linea.substr(0, linea.find(' ')) << "," << ms << "," << resultadoDe(respuesta) << std::endl;
+        csv << linea.substr(0, linea.find(' ')) << "," << inicio << "," << ms << ","
+            << resultadoDe(respuesta) << std::endl;
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(espera));
+        pausar(porMinuto);
     }
     std::cout << "Terminado. Tiempos guardados en metricas_" << ruta << ".csv" << std::endl;
 }
@@ -207,8 +224,7 @@ void modoCarga(ReqConReintento& gestor, const std::string& nombre, int pctConsul
     };
 
     std::ofstream csv("metricas_" + nombre + ".csv");
-    csv << "operacion,ms,resultado" << std::endl;
-    int espera = 60000 / porMinuto;
+    csv << "operacion,inicio_ms,ms,resultado" << std::endl;
     std::cout << "Carga de " << nombre << ": " << operaciones << " operaciones, " << pctConsulta
               << " % consulta, " << pctReserva << " % reserva, " << pctModificacion
               << " % modificacion, " << porMinuto << " por minuto" << std::endl;
@@ -231,12 +247,13 @@ void modoCarga(ReqConReintento& gestor, const std::string& nombre, int pctConsul
         }
 
         double ms;
+        long long inicio = ahoraMs();
         std::string respuesta = enviarSolicitud(gestor, linea, ms);
         std::string operacion = linea.substr(0, linea.find(' '));
         std::string resultado = resultadoDe(respuesta);
         std::cout << linea << "  =>  " << respuesta.substr(0, respuesta.find('\n'))
                   << "  (" << (int)ms << " ms)" << std::endl;
-        csv << operacion << "," << ms << "," << resultado << std::endl;
+        csv << operacion << "," << inicio << "," << ms << "," << resultado << std::endl;
 
         // llevar la cuenta de donde tiene reservas para poder modificarlas despues
         if (resultado == "EXITO") {
@@ -249,7 +266,7 @@ void modoCarga(ReqConReintento& gestor, const std::string& nombre, int pctConsul
                 misReservas.push_back({p[1], p[4]});
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(espera));
+        pausar(porMinuto);
     }
     std::cout << "Terminado. Tiempos guardados en metricas_" << nombre << ".csv" << std::endl;
 }
@@ -268,6 +285,8 @@ int main(int argc, char* argv[]) {
         {direccion(cfg["GESTOR_IP"], cfg["GESTOR_PUERTO"]),
          direccion(cfg["GESTOR_IP"], cfg["GESTOR2_PUERTO"])},
         std::stoi(cfg["ESPERA_GESTOR_MS"]), std::stoi(cfg["INTENTOS_GESTOR"]), "Cliente");
+    const char* inicial = std::getenv("SRB_GESTOR_INICIAL");
+    if (inicial && std::string(inicial) == "2") gestor.empezarEn(1);
 
     // hilo que recibe las notificaciones de cancelacion (el PUB esta en la VM de cancelaciones)
     std::thread hiloNotificaciones(escucharNotificaciones, &context,

@@ -12,3 +12,5 @@ tpm_gestor*.csv
 # Respaldos del editor
 *.save
 *~
+# El .zip de la entrega se arma con make zip
+SRB_Entrega2.zip
