@@ -1,0 +1,53 @@
+# Direcciones de cada servicio. El MISMO archivo va en las 3 VMs.
+# Las IP son las reales de cada VM (se ven con: hostname -I).
+#   VM2 (gestor, RMC, cancelaciones): GESTOR_IP y CANCELACION_IP
+#   VM3 (persistencia):               PERSISTENCIA_IP
+# Para probar todo en un solo computador, ponga las tres en 127.0.0.1.
+
+# --- VM2: lógica de negocio -------------------------------------------------
+GESTOR_IP=10.43.100.44
+
+# Puertos donde cada gestor atiende a los clientes.
+# Se levantan los dos: si matan el principal, el cliente se pasa al de respaldo.
+GESTOR_PUERTO=5555
+GESTOR2_PUERTO=5565
+
+# Puertos donde cada gestor reparte el trabajo entre los RMC.
+# OJO: aquí hace bind el GESTOR, y los RMC hacen connect. Esa inversión es lo
+# que permite levantar varios RMC sin que choquen por el puerto.
+RMC_BACKEND_PUERTO=5556
+RMC_BACKEND2_PUERTO=5566
+
+# Servicio de cancelación (misma VM que el gestor)
+CANCELACION_IP=10.43.100.44
+CANCELACION_PUERTO=5557
+NOTIFICACION_PUERTO=5558
+
+# --- VM3: almacenamiento ----------------------------------------------------
+PERSISTENCIA_IP=10.43.99.231
+
+# Principal: atiende escrituras y disponibilidad en tiempo real.
+PERSISTENCIA_PUERTO=6666
+BD_ARCHIVO=reserva.db
+
+# Réplica de lectura: atiende las consultas del mes.
+REPLICA_PUERTO=6667
+BD_REPLICA=reserva_replica.db
+
+# Canal por el que el principal le copia cada cambio a la réplica.
+REPLICA_SYNC_PUERTO=6668
+
+# --- Tiempos de espera (Lazy Pirate) ----------------------------------------
+# Si un servicio no responde en ESPERA_*_MS, se bota el socket, se abre otro y se
+# reenvía la solicitud, hasta INTENTOS_* veces.
+# Regla: cada capa espera MÁS de lo que tarda en rendirse la capa de abajo. Si no,
+# la de arriba reintenta mientras la de abajo todavía está esperando.
+#   RMC -> persistencia:  500 ms x 2      -> a lo sumo 1,5 s por solicitud (reserva)
+#   gestor -> RMC:       2000 ms x 2      -> a lo sumo 4 s
+#   cliente -> gestor:   5000 ms x 3      (gestor 1 -> gestor 2 -> gestor 1)
+ESPERA_PERSISTENCIA_MS=500
+INTENTOS_PERSISTENCIA=2
+ESPERA_RMC_MS=2000
+INTENTOS_RMC=2
+ESPERA_GESTOR_MS=5000
+INTENTOS_GESTOR=3

@@ -1,0 +1,16 @@
+# Binarios: cada VM compila con make
+cliente
+gestor
+rmc
+cancelaciones
+persistencia
+# La BD se genera desde init_db.sql
+*.db
+# Archivos que se generan al correr
+metricas_*.csv
+tpm_gestor*.csv
+# Respaldos del editor
+*.save
+*~
+# El .zip de la entrega se arma con make zip
+SRB_Entrega2.zip

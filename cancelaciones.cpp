@@ -1,47 +1,61 @@
-#include "cancelaciones.h"
-#include <sqlite3.h>
+// Servicio de cancelaciones (VM2): canal asincrono.
+// Recibe del gestor (PULL)      ELIMINAR <idSol> <evento> <fecha> <cliente>
+// le pide a la persistencia liberar los asientos y publica el resultado (PUB):
+//   <cliente> CANCELACION <evento> <fecha>: <resultado>
+// El cliente que pidio la cancelacion esta suscrito y recibe la notificacion. El primer
+// texto del mensaje es el nombre del cliente: con eso cada cliente se queda solo con la suya.
+
+#include "common.hpp"
 #include <iostream>
+#include <string>
 
-std::string eliminarReserva(const std::string& idEvento, const std::string& cliente) {
-    sqlite3* db;
-    sqlite3_open("reserva.db", &db);
+int main() {
+    auto cfg = leerConfig();
+    zmq::context_t context(1);
 
-    int totalSillas = 0;
+    // Socket PULL, recibe lo que manda el gestor
+    zmq::socket_t socketGestor(context, ZMQ_PULL);
+    socketGestor.set(zmq::sockopt::rcvtimeo, PULSO_MS);   // despertar cada segundo para el watchdog
+    socketGestor.bind("tcp://*:" + cfg["CANCELACION_PUERTO"]);
 
-    // 1. Sumar todas las reservas del cliente en ese evento
-    std::string querySum = "SELECT SUM(numAsientos) FROM Reservas WHERE idEvento=? AND cliente=?;";
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, querySum.c_str(), -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt, 1, idEvento.c_str(), -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, cliente.c_str(), -1, SQLITE_STATIC);
+    // REQ hacia la persistencia, con tiempo de espera y reintento (Lazy Pirate).
+    // Reintentar ELIMINAR es seguro: si ya se aplico, la segunda vez no encuentra
+    // la reserva y no libera nada mas.
+    ReqConReintento persistencia(context,
+        {direccion(cfg["PERSISTENCIA_IP"], cfg["PERSISTENCIA_PUERTO"])},
+        std::stoi(cfg["ESPERA_PERSISTENCIA_MS"]), std::stoi(cfg["INTENTOS_PERSISTENCIA"]), "Cancelacion");
 
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        totalSillas = sqlite3_column_int(stmt, 0);
+    // PUB hacia los clientes: notificacion de cada cancelacion terminada
+    zmq::socket_t socketNotificacion(context, ZMQ_PUB);
+    socketNotificacion.bind("tcp://*:" + cfg["NOTIFICACION_PUERTO"]);
+
+    std::cout << "Cancelaciones escuchando en puerto " << cfg["CANCELACION_PUERTO"]
+              << ", notificando en " << cfg["NOTIFICACION_PUERTO"]
+              << ", conectado a persistencia en " << cfg["PERSISTENCIA_IP"] << ":"
+              << cfg["PERSISTENCIA_PUERTO"] << std::endl;
+
+    avisarListo();   // a systemd: ya hice el bind, estoy listo
+
+    while (true) {
+        avisarVivo();   // watchdog: cada vuelta, al menos una por segundo, systemd sabe que sigue bien
+        zmq::message_t request;
+        if (!socketGestor.recv(request, zmq::recv_flags::none)) continue;   // no llego nada en 1 s
+        std::string msg(static_cast<char*>(request.data()), request.size());   // ej: "ELIMINAR a3f9-7 E5 2026-11-02 juan"
+        std::cout << "[Cancelacion] Recibido: " << msg << std::endl;
+
+        auto p = partir(msg);   // ELIMINAR <idSol> <evento> <fecha> <cliente>
+        if (p.size() != 5) {
+            std::cout << "[Cancelacion] Formato invalido, se descarta" << std::endl;
+            continue;
+        }
+
+        // ELIMINAR lleva el idSol: si se reenvia, la persistencia no la aplica dos veces
+        auto resp = persistencia.pedir(msg);
+        std::string respuesta = resp ? *resp : "la persistencia no responde, la cancelacion no se aplico";
+        std::cout << "[Cancelacion] Resultado: " << respuesta << std::endl;
+
+        std::string notificacion = p[4] + " CANCELACION " + p[2] + " " + p[3] + ": " + respuesta;
+        socketNotificacion.send(zmq::buffer(notificacion), zmq::send_flags::none);
+        std::cout << "[Cancelacion] Notificado: " << notificacion << std::endl;
     }
-    sqlite3_finalize(stmt);
-
-    if (totalSillas > 0) {
-        // 2. Eliminar todas las reservas de ese cliente en ese evento
-        std::string queryDelete = "DELETE FROM Reservas WHERE idEvento=? AND cliente=?;";
-        sqlite3_prepare_v2(db, queryDelete.c_str(), -1, &stmt, nullptr);
-        sqlite3_bind_text(stmt, 1, idEvento.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 2, cliente.c_str(), -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-
-        // 3. Actualizar el evento liberando esas sillas
-        std::string queryUpdate = "UPDATE Eventos SET asientosLibres = asientosLibres + ?, asientosOcupados = asientosOcupados - ? WHERE idEvento=?;";
-        sqlite3_prepare_v2(db, queryUpdate.c_str(), -1, &stmt, nullptr);
-        sqlite3_bind_int(stmt, 1, totalSillas);
-        sqlite3_bind_int(stmt, 2, totalSillas);
-        sqlite3_bind_text(stmt, 3, idEvento.c_str(), -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-
-        sqlite3_close(db);
-        return "Reserva cancelada correctamente. Se liberaron " + std::to_string(totalSillas) + " asientos.";
-    }
-
-    sqlite3_close(db);
-    return "No existe reserva para cliente=" + cliente + " en evento=" + idEvento;
 }

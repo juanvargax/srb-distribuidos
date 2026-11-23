@@ -1,74 +1,344 @@
-#include <zmq.hpp>
+// Cliente (VM1)
+//
+// ./cliente                       -> se escribe cada solicitud en una linea
+// ./cliente archivo.txt 20        -> manda las operaciones del archivo, 20 por minuto
+// ./cliente carga C1 50 50 0 60 20
+//                                 -> genera 60 operaciones del cliente C1 al azar, con
+//                                    50 % consultas, 50 % reservas y 0 % modificaciones, 20 por minuto
+//                                    (porMinuto 0 = sin pausa, lo mas rapido que responda el sistema)
+//
+// Variable de entorno SRB_GESTOR_INICIAL=2: empieza por el gestor de respaldo en vez del principal
+// (los experimentos de la arquitectura escalable reparten asi los clientes entre los dos gestores).
+//
+// Formato de una solicitud (igual en la terminal y en el archivo):
+//   CONSULTA <AAAA-MM>
+//   RESERVA <evento> <AAAA-MM-DD> <cliente> <asientos>
+//   MODIFICACION <evento> <AAAA-MM-DD> <cliente> <nuevaFecha> <asientos>
+//   ELIMINAR <evento> <AAAA-MM-DD> <cliente>
+//
+// Antes de enviarla, el cliente le agrega un id unico (idSol) despues del tipo:
+//   RESERVA a3f9c1-7 E1 2026-11-18 laura 2
+// Si hay que reenviarla (Lazy Pirate), va con el mismo idSol y la persistencia no la aplica dos veces.
+//
+// Las cancelaciones son asincronas: el gestor responde RECIBIDO de una vez y el resultado
+// llega despues como notificacion (SUB), que se imprime como [Notificacion] ...
+//
+// En los modos archivo y carga guarda cada solicitud en un CSV para las graficas:
+//   operacion,inicio_ms,ms,resultado     (inicio_ms = hora en que salio, en ms desde 1970)
+
+#include "common.hpp"
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
+#include <random>
+#include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
-int main() {
-    zmq::context_t context(1);
-    zmq::socket_t socket(context, ZMQ_REQ);
-    socket.connect("tcp://10.43.100.44:5555");
-    while (true){
-    	//seleccion cliente
-    	std::string accion;
-    	std::cout<<"seleccione la accion a realizar :"<<std::endl;
-    	std::cout<<"1. Consulta"<<std::endl;
-    	std::cout<<"2. Reserva"<<std::endl;
-    	std::cout<<"3. Eliminar"<<std::endl;
-    	std::cin>>accion;
-    	if (accion == "Consulta" || accion == "1"){
-    		// Enviar consulta
-    		std::string consulta = "CONSULTA";
-    		zmq::message_t request(consulta.size());
-    		memcpy(request.data(), consulta.c_str(), consulta.size());
-    		zmq::send_result_t sent1 = socket.send(request, zmq::send_flags::none);
+// ---------------------------------------------------------------------------
+// Id unico por solicitud: un prefijo al azar por cada cliente que se abre + un contador.
+// ---------------------------------------------------------------------------
+std::mt19937 azar{std::random_device{}()};
+std::string prefijoIdSol;
+int contadorSolicitudes = 0;
 
-    		zmq::message_t reply;
-    		zmq::recv_result_t result1 = socket.recv(reply, zmq::recv_flags::none);
-    		std::string respuesta(static_cast<char*>(reply.data()), reply.size());
-    		std::cout << "Respuesta: " << respuesta << std::endl;
-
-
-
-   	}else if (accion == "Reserva" || accion == "2"){
-		// Enviar reserva
-    		std::string idEvento, cliente;
-		int numAsientos;
-		std::cout<<"Ingrese ID del evento "<<std::endl;
-		std::cin>>idEvento;
-		std::cout<<"Ingrese nombre del cliente "<<std::endl;
-		std::cin>> cliente;
-		std::cout<<"ingrese numero de asientos "<<std::endl;
-		std::cin>>numAsientos;
-		std::string reserva = "RESERVA " + idEvento + " " + cliente + " " + std::to_string(numAsientos);
-    		zmq::message_t request2(reserva.size());
-    		memcpy(request2.data(), reserva.c_str(), reserva.size());
-    		zmq::send_result_t sent2 = socket.send(request2, zmq::send_flags::none);
-
-    		zmq::message_t reply2;
-    		zmq::recv_result_t result2 = socket.recv(reply2, zmq::recv_flags::none);
-    		std::string respuesta2(static_cast<char*>(reply2.data()), reply2.size());
-    		std::cout << "Respuesta: " << respuesta2 << std::endl;
-	} else if (accion == "eliminar" || accion == "3") {
-        	// Pedir datos al usuario
-        	std::string idEvento, cliente;
-        	std::cout << "Ingrese ID del evento a cancelar: ";
-        	std::cin >> idEvento;
-        	std::cout << "Ingrese nombre del cliente: ";
-        	std::cin >> cliente;
-
-        	// Construir comando
-        	std::string eliminar = "ELIMINAR " + idEvento + " " + cliente;
-        	zmq::message_t request3(eliminar.size());
-        	memcpy(request3.data(), eliminar.c_str(), eliminar.size());
-        	zmq::send_result_t sent3 = socket.send(request3, zmq::send_flags::none);
-	
-        	zmq::message_t reply3;
-        	zmq::recv_result_t result3 = socket.recv(reply3, zmq::recv_flags::none);
-        	std::string respuesta(static_cast<char*>(reply3.data()), reply3.size());
-        	std::cout << "Respuesta: " << respuesta << std::endl;
-	}else{
-		std::cout<<"accion no reconocida "<<std::endl;
-    	}
-    }
-    return 0;
+std::string conIdSol(const std::string& linea) {
+    std::string idSol = prefijoIdSol + "-" + std::to_string(++contadorSolicitudes);
+    size_t espacio = linea.find(' ');
+    return linea.substr(0, espacio) + " " + idSol + linea.substr(espacio);
 }
 
+// manda una solicitud al gestor, espera la respuesta y mide cuanto se demoro (ms).
+// Si el gestor no responde a tiempo, ReqConReintento reenvia la misma solicitud (mismo
+// idSol) al otro gestor (Lazy Pirate). El tiempo medido incluye esos reintentos.
+std::string enviarSolicitud(ReqConReintento& gestor, const std::string& linea, double& ms) {
+    std::string solicitud = conIdSol(linea);
+    auto inicio = std::chrono::steady_clock::now();
+    auto respuesta = gestor.pedir(solicitud);
+    auto fin = std::chrono::steady_clock::now();
+    ms = std::chrono::duration<double, std::milli>(fin - inicio).count();
+
+    if (!respuesta) return "SIN_RESPUESTA: ningun gestor respondio";
+    return *respuesta;
+}
+
+// hora actual en milisegundos desde 1970 (para saber cuando salio cada solicitud y calcular el TPM)
+long long ahoraMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// pausa entre solicitudes para respetar 'porMinuto' (0 = sin pausa)
+void pausar(int porMinuto) {
+    if (porMinuto > 0) std::this_thread::sleep_for(std::chrono::milliseconds(60000 / porMinuto));
+}
+
+std::string resultadoDe(const std::string& respuesta) {   // para la columna del CSV
+    if (respuesta.substr(0, 5) == "EXITO") return "EXITO";
+    if (respuesta.substr(0, 8) == "RECIBIDO") return "RECIBIDO";
+    if (respuesta.substr(0, 13) == "SIN_RESPUESTA") return "SIN_RESPUESTA";
+    return "RECHAZO";
+}
+
+// revisa que la linea sea una solicitud conocida con el numero de datos correcto,
+// para avisar del error de una vez sin mandarla al gestor
+bool formatoValido(const std::string& linea) {
+    auto p = partir(linea);
+    if (p.empty()) return false;
+    return (p[0] == "CONSULTA"     && p.size() == 2) ||
+           (p[0] == "RESERVA"      && p.size() == 5) ||
+           (p[0] == "MODIFICACION" && p.size() == 6) ||
+           (p[0] == "ELIMINAR"     && p.size() == 4);
+}
+
+// ---------------------------------------------------------------------------
+// Notificaciones de cancelacion (PUB/SUB).
+// Un hilo aparte tiene el socket SUB y espera las notificaciones mientras el hilo
+// principal sigue mandando solicitudes. El tema es el nombre del cliente seguido de
+// un espacio ("laura "): asi "laura" no recibe tambien las de "laura2".
+// Un socket de ZeroMQ no se comparte entre hilos, por eso las suscripciones nuevas se
+// le piden al hilo por una lista protegida con un mutex, y el hilo las aplica.
+// ---------------------------------------------------------------------------
+std::mutex mutexNotif;
+std::condition_variable avisoNotif;
+std::vector<std::string> porSuscribir;   // nombres que el hilo todavia no ha suscrito
+std::set<std::string> suscritos;
+std::atomic<bool> terminar{false};
+
+void escucharNotificaciones(zmq::context_t* contexto, std::string direccionPub) {
+    zmq::socket_t sub(*contexto, ZMQ_SUB);
+    sub.set(zmq::sockopt::rcvtimeo, 100);   // revisar cada 100 ms si hay suscripciones nuevas
+    sub.connect(direccionPub);
+
+    while (!terminar) {
+        {
+            std::lock_guard<std::mutex> candado(mutexNotif);
+            for (const auto& nombre : porSuscribir) {
+                sub.set(zmq::sockopt::subscribe, nombre + " ");
+                suscritos.insert(nombre);
+            }
+            if (!porSuscribir.empty()) {
+                porSuscribir.clear();
+                avisoNotif.notify_all();
+            }
+        }
+        zmq::message_t mensaje;
+        if (sub.recv(mensaje, zmq::recv_flags::none))
+            std::cout << "[Notificacion] " << mensaje.to_string() << std::endl;
+    }
+}
+
+// pide las notificaciones de un cliente y espera a que el hilo ya este suscrito,
+// para no perder la notificacion de la cancelacion que se va a mandar ahora
+void suscribir(const std::string& nombre) {
+    std::unique_lock<std::mutex> candado(mutexNotif);
+    if (suscritos.count(nombre)) return;
+    porSuscribir.push_back(nombre);
+    avisoNotif.wait(candado, [&] { return suscritos.count(nombre) > 0; });
+}
+
+// si la linea es una cancelacion, suscribirse al cliente antes de mandarla
+void prepararNotificacion(const std::string& linea) {
+    auto p = partir(linea);
+    if (p.size() == 4 && p[0] == "ELIMINAR") suscribir(p[3]);
+}
+
+// ---------------------------------------------------------------------------
+// Modo archivo: lee las operaciones de un archivo y las manda una por una
+// ---------------------------------------------------------------------------
+void modoArchivo(ReqConReintento& gestor, const std::string& ruta, int porMinuto) {
+    std::ifstream archivo(ruta);
+    if (!archivo) {
+        std::cout << "No se encontro " << ruta << std::endl;
+        return;
+    }
+    std::ofstream csv("metricas_" + ruta + ".csv");
+    csv << "operacion,inicio_ms,ms,resultado" << std::endl;
+
+    std::string linea;
+    while (std::getline(archivo, linea)) {
+        if (linea.empty() || linea[0] == '#') continue;
+        prepararNotificacion(linea);
+
+        double ms;
+        long long inicio = ahoraMs();
+        std::string respuesta = enviarSolicitud(gestor, linea, ms);
+        std::cout << linea << "  =>  " << respuesta.substr(0, respuesta.find('\n'))
+                  << "  (" << (int)ms << " ms)" << std::endl;
+        csv << linea.substr(0, linea.find(' ')) << "," << inicio << "," << ms << ","
+            << resultadoDe(respuesta) << std::endl;
+
+        pausar(porMinuto);
+    }
+    std::cout << "Terminado. Tiempos guardados en metricas_" << ruta << ".csv" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Modo carga: genera operaciones al azar con el porcentaje pedido de cada tipo.
+// Es lo que se usa en los experimentos (Tabla 1 del enunciado).
+//   - Las consultas son del mes MES_CARGA.
+//   - Las reservas son de 1 a 3 asientos en una ocurrencia al azar.
+//   - Las modificaciones cambian una reserva que el cliente ya tiene: a otra fecha del
+//     mismo evento o a otro numero de asientos. Si todavia no tiene ninguna, esa
+//     operacion se manda como reserva, para tener algo que modificar.
+// ---------------------------------------------------------------------------
+const std::string MES_CARGA = "2026-11";
+
+struct Ocurrencia {
+    std::string evento, fecha;
+};
+
+// pide la lista de eventos del mes y la convierte en ocurrencias (evento, fecha)
+std::vector<Ocurrencia> leerEventos(ReqConReintento& gestor) {
+    double ms;
+    std::string respuesta = enviarSolicitud(gestor, "CONSULTA " + MES_CARGA, ms);
+    std::vector<Ocurrencia> lista;
+    std::istringstream lineas(respuesta);
+    std::string linea;
+    while (std::getline(lineas, linea)) {   // "Evento: E1 | Fecha: 2026-11-18 | Libres: ..."
+        auto p = partir(linea);
+        if (p.size() >= 5 && p[0] == "Evento:") lista.push_back({p[1], p[4]});
+    }
+    return lista;
+}
+
+void modoCarga(ReqConReintento& gestor, const std::string& nombre, int pctConsulta, int pctReserva,
+               int pctModificacion, int operaciones, int porMinuto) {
+    auto eventos = leerEventos(gestor);
+    if (eventos.empty()) {
+        std::cout << "No se pudo leer la lista de eventos de " << MES_CARGA << std::endl;
+        return;
+    }
+    std::map<std::string, std::vector<std::string>> fechasDe;   // evento -> sus fechas
+    for (const auto& o : eventos) fechasDe[o.evento].push_back(o.fecha);
+
+    std::vector<Ocurrencia> misReservas;   // donde tiene reserva este cliente
+    auto alAzar = [](int desde, int hasta) {
+        return std::uniform_int_distribution<int>(desde, hasta)(azar);
+    };
+
+    std::ofstream csv("metricas_" + nombre + ".csv");
+    csv << "operacion,inicio_ms,ms,resultado" << std::endl;
+    std::cout << "Carga de " << nombre << ": " << operaciones << " operaciones, " << pctConsulta
+              << " % consulta, " << pctReserva << " % reserva, " << pctModificacion
+              << " % modificacion, " << porMinuto << " por minuto" << std::endl;
+
+    for (int i = 0; i < operaciones; i++) {
+        int dado = alAzar(1, 100);
+        std::string linea;
+        if (dado <= pctConsulta) {
+            linea = "CONSULTA " + MES_CARGA;
+        } else if (dado <= pctConsulta + pctReserva || misReservas.empty()) {
+            const auto& o = eventos[alAzar(0, eventos.size() - 1)];
+            linea = "RESERVA " + o.evento + " " + o.fecha + " " + nombre + " " + std::to_string(alAzar(1, 3));
+        } else {
+            int cual = alAzar(0, misReservas.size() - 1);
+            const auto& r = misReservas[cual];
+            const auto& fechas = fechasDe[r.evento];
+            std::string nuevaFecha = fechas[alAzar(0, fechas.size() - 1)];
+            linea = "MODIFICACION " + r.evento + " " + r.fecha + " " + nombre + " " + nuevaFecha + " " +
+                    std::to_string(alAzar(1, 3));
+        }
+
+        double ms;
+        long long inicio = ahoraMs();
+        std::string respuesta = enviarSolicitud(gestor, linea, ms);
+        std::string operacion = linea.substr(0, linea.find(' '));
+        std::string resultado = resultadoDe(respuesta);
+        std::cout << linea << "  =>  " << respuesta.substr(0, respuesta.find('\n'))
+                  << "  (" << (int)ms << " ms)" << std::endl;
+        csv << operacion << "," << inicio << "," << ms << "," << resultado << std::endl;
+
+        // llevar la cuenta de donde tiene reservas para poder modificarlas despues
+        if (resultado == "EXITO") {
+            auto p = partir(linea);
+            if (operacion == "RESERVA") {
+                misReservas.push_back({p[1], p[2]});
+            } else if (operacion == "MODIFICACION") {
+                for (auto it = misReservas.begin(); it != misReservas.end();)   // todas quedan en una
+                    it = (it->evento == p[1] && it->fecha == p[2]) ? misReservas.erase(it) : it + 1;
+                misReservas.push_back({p[1], p[4]});
+            }
+        }
+        pausar(porMinuto);
+    }
+    std::cout << "Terminado. Tiempos guardados en metricas_" << nombre << ".csv" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+int main(int argc, char* argv[]) {
+    auto cfg = leerConfig();
+    zmq::context_t context(1);
+
+    char prefijo[8];
+    std::snprintf(prefijo, sizeof(prefijo), "%06x", (unsigned)(azar() & 0xFFFFFF));
+    prefijoIdSol = prefijo;
+
+    // Los dos gestores: se empieza por el principal y, si no responde, se pasa al respaldo
+    ReqConReintento gestor(context,
+        {direccion(cfg["GESTOR_IP"], cfg["GESTOR_PUERTO"]),
+         direccion(cfg["GESTOR_IP"], cfg["GESTOR2_PUERTO"])},
+        std::stoi(cfg["ESPERA_GESTOR_MS"]), std::stoi(cfg["INTENTOS_GESTOR"]), "Cliente");
+    const char* inicial = std::getenv("SRB_GESTOR_INICIAL");
+    if (inicial && std::string(inicial) == "2") gestor.empezarEn(1);
+
+    // hilo que recibe las notificaciones de cancelacion (el PUB esta en la VM de cancelaciones)
+    std::thread hiloNotificaciones(escucharNotificaciones, &context,
+                                   direccion(cfg["CANCELACION_IP"], cfg["NOTIFICACION_PUERTO"]));
+
+    if (argc >= 7 && std::string(argv[1]) == "carga") {
+        int c = std::stoi(argv[3]), r = std::stoi(argv[4]), m = std::stoi(argv[5]);
+        if (c + r + m != 100) {
+            std::cout << "Los porcentajes deben sumar 100 (van " << c + r + m << ")" << std::endl;
+        } else {
+            modoCarga(gestor, argv[2], c, r, m, std::stoi(argv[6]), argc > 7 ? std::stoi(argv[7]) : 20);
+        }
+    } else if (argc > 1 && std::string(argv[1]) == "carga") {
+        std::cout << "uso: ./cliente carga <nombre> <%consulta> <%reserva> <%modificacion> <operaciones> [porMinuto]\n"
+                  << "ej:  ./cliente carga C1 50 50 0 60 20" << std::endl;
+    } else if (argc > 1) {
+        modoArchivo(gestor, argv[1], argc > 2 ? std::stoi(argv[2]) : 20);
+    } else {
+        // modo interactivo: cada solicitud se escribe completa en una sola linea, sin menu
+        std::cout << "Escriba una solicitud por linea (SALIR para terminar):\n"
+                  << "  CONSULTA <AAAA-MM>\n"
+                  << "  RESERVA <evento> <AAAA-MM-DD> <cliente> <asientos>\n"
+                  << "  MODIFICACION <evento> <AAAA-MM-DD> <cliente> <nuevaFecha> <asientos>\n"
+                  << "  ELIMINAR <evento> <AAAA-MM-DD> <cliente>\n";
+
+        std::string linea;
+        while (std::cout << "> " && std::getline(std::cin, linea)) {
+            // la primera palabra se pasa a mayusculas: "consulta 2026-11" tambien sirve
+            for (size_t i = 0; i < linea.size() && linea[i] != ' '; i++)
+                linea[i] = std::toupper(static_cast<unsigned char>(linea[i]));
+
+            if (linea.empty()) continue;
+            if (linea == "SALIR") break;
+            if (!formatoValido(linea)) {
+                std::cout << "Formato no valido. Ejemplos:\n"
+                          << "  CONSULTA 2026-11\n"
+                          << "  RESERVA E1 2026-11-18 laura 2\n"
+                          << "  MODIFICACION E1 2026-11-18 laura 2026-11-06 3\n"
+                          << "  ELIMINAR E1 2026-11-18 laura" << std::endl;
+                continue;
+            }
+            prepararNotificacion(linea);
+
+            double ms;
+            std::string respuesta = enviarSolicitud(gestor, linea, ms);
+            std::cout << respuesta << "\n(" << (int)ms << " ms)" << std::endl;
+        }
+    }
+
+    // antes de salir, dar un momento por si falta llegar la notificacion de la ultima cancelacion
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    terminar = true;
+    hiloNotificaciones.join();
+    return 0;
+}
